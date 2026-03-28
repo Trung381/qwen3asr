@@ -1,0 +1,38 @@
+services:
+  qwen3-asr:
+    build:
+      context: .
+      args:
+        # Set to "true" to build flash-attn inside the image (slow, adds ~20 min to build)
+        BUNDLE_FLASH_ATTENTION: "false"
+    image: qwen3-asr:latest
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      # --- Tunable config (override via .env or CLI) ---
+      - MODEL_NAME=${MODEL_NAME:-Qwen/Qwen3-ASR-1.7B}
+      - GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.85}
+      - MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
+      - HOST=${HOST:-0.0.0.0}
+      - PORT=${PORT:-8000}
+    volumes:
+      # Persist downloaded model weights between container restarts
+      - ./models:/root/.cache/huggingface/hub
+      # Persist compiled Triton GPU kernels — skips ~40s recompile on restart
+      - triton_cache:/root/.triton
+      # Persist vLLM torch-compile cache
+      - torch_compile_cache:/root/.cache/vllm
+    ports:
+      - "${PORT:-8000}:${PORT:-8000}"
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  triton_cache:
+  torch_compile_cache:
