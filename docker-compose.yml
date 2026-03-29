@@ -15,6 +15,7 @@ services:
       - MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
       - HOST=${HOST:-0.0.0.0}
       - PORT=${PORT:-8000}
+      - GRPC_PORT=${GRPC_PORT:-50051}
     volumes:
       # Persist downloaded model weights between container restarts
       - ./models:/root/.cache/huggingface/hub
@@ -24,6 +25,7 @@ services:
       - torch_compile_cache:/root/.cache/vllm
     ports:
       - "${PORT:-8000}:${PORT:-8000}"
+      - "${GRPC_PORT:-50051}:${GRPC_PORT:-50051}"
     restart: unless-stopped
     deploy:
       resources:

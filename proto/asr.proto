@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package asr;
+
+option go_package = "github.com/smartiva/qwen3-asr-client/proto;asr";
+
+service ASRService {
+  // Bidirectional streaming: client sends audio chunks, server responds with partial transcriptions.
+  rpc TranscribeStream (stream AudioChunk) returns (stream TranscriptChunk);
+}
+
+message AudioChunk {
+  // Raw PCM audio data, float32 little-endian, mono channel
+  bytes audio_data = 1;
+
+  // Sample rate of the audio (e.g. 16000 for 16 kHz)
+  int32 sample_rate = 2;
+
+  // Optional language hint (e.g. "English", "Chinese"). Empty = auto-detect.
+  string language = 3;
+
+  // When true, signals the end of the stream. Server will flush and finalize.
+  bool is_final = 4;
+}
+
+message TranscriptChunk {
+  // Partial or final transcribed text
+  string text = 1;
+
+  // Detected or hinted language
+  string language = 2;
+
+  // When true, this is the final consolidated transcription for this stream
+  bool is_final = 3;
+}

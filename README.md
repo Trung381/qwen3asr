@@ -8,8 +8,17 @@ A production-ready HTTP API for [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-AS
 ├── Dockerfile              # CUDA 12.8 image with all env fixes baked in
 ├── docker-compose.yml      # GPU passthrough, volume caching, config via env
 ├── .env.example            # Copy to .env and tune for your GPU
+├── proto/
+│   └── asr.proto           # gRPC service definition
 ├── app/
-│   └── server.py           # FastAPI server — /health and /transcribe endpoints
+│   ├── server.py           # FastAPI (HTTP) + gRPC server
+│   ├── grpc_servicer.py    # gRPC bidirectional streaming handler
+│   └── proto/              # Python stubs (generated during Docker build)
+├── client/
+│   ├── main.go             # Go gRPC client: mic streaming + file test
+│   ├── go.mod
+│   └── proto/              # Go stubs (generated via `make proto`)
+└── Makefile                # proto generation + build shortcuts
 ```
 
 ---
@@ -145,10 +154,64 @@ curl -X POST "http://localhost:8000/transcribe?language=English" -F "file=@audio
 > On **Windows PowerShell**, use `curl.exe` instead of `curl` to avoid the PowerShell alias.
 
 ### `GET /health`
-Returns `{"status":"ok","model":"...","ready":true}` when the model is loaded and ready.
+Returns `{"status":"ok","model":"...","ready":true,"grpc_port":50051}` when the model is loaded and ready.
 
 ### Swagger UI
 Open **http://localhost:8000/docs** in your browser for an interactive API explorer.
+
+---
+
+## gRPC Streaming (Go Client)
+
+For real-time, low-latency transcription, use the gRPC streaming API with the Go client.
+
+### Prerequisites
+```bash
+# Install Go: https://go.dev/dl/
+# Install protoc: https://grpc.io/docs/protoc-installation/
+go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+
+# On Windows/Linux for PortAudio (mic input):
+# Ubuntu/WSL: sudo apt-get install portaudio19-dev
+# Windows: vcpkg install portaudio
+```
+
+### Setup
+```bash
+# Generate Go proto stubs
+make proto
+
+# Install Go dependencies
+cd client && go mod tidy
+```
+
+### Stream a WAV file (smoke test)
+```bash
+make test-client
+# or:
+cd client && go run . --file ../test_en.wav --language English
+```
+
+### Live microphone streaming
+```bash
+make run-client
+# or:
+cd client && go run . --language English
+
+# List available mic devices
+cd client && go run . --list-devices
+
+# Full options
+cd client && go run . --host localhost --port 50051 --language English --chunk-ms 500 --silence-ms 2000
+```
+
+**Output while speaking:**
+```
+[partial] "Hello, this is"
+[partial] "Hello, this is a test"
+[final]   lang="English"  text="Hello, this is a test transcription."
+```
 
 ---
 

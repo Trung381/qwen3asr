@@ -56,9 +56,9 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
         pip3 install -U flash-attn --no-build-isolation; \
     fi
 
-# Install FastAPI server dependencies
+# Install FastAPI server dependencies + gRPC
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip3 install fastapi uvicorn python-multipart
+    pip3 install fastapi uvicorn python-multipart grpcio grpcio-tools
 
 # Fix: Triton links against -lcuda at compile time, and vLLM spawns child processes
 # using Python's 'spawn' method (fresh env). We need libcuda.so visible system-wide
@@ -74,9 +74,22 @@ RUN TRITON_LIB=$(python3 -c "import triton, os; print(os.path.join(os.path.dirna
 
 RUN rm -rf /root/.cache/pip
 
+# Copy proto definition and compile to Python stubs
+COPY proto/ ./proto/
+RUN mkdir -p app/proto \
+    && python3 -m grpc_tools.protoc \
+        -I proto \
+        --python_out=app/proto \
+        --grpc_python_out=app/proto \
+        proto/asr.proto \
+    && touch app/proto/__init__.py \
+    && sed -i 's/^import asr_pb2/from . import asr_pb2/' app/proto/asr_pb2_grpc.py \
+    && echo "Proto stubs generated and import patched."
+
 # Copy the server application
 COPY app/ ./app/
 
 EXPOSE 8000
+EXPOSE 50051
 
-CMD ["python3", "app/server.py"]
+CMD ["python3", "-m", "app.server"]
