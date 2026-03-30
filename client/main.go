@@ -50,6 +50,22 @@ import (
 	pb "github.com/smartiva/qwen3-asr-client/proto"
 )
 
+// ─── VAD (Voice Activity Detection) config ────────────────────────────────────
+
+const (
+	// silenceThreshold: RMS energy below this = silence.
+	// Tune this for your mic: louder room → raise to 0.01 or 0.02.
+	silenceThreshold = 0.005
+
+	// silenceChunks: how many consecutive silent chunks before we treat it
+	// as end-of-speech. At 500ms chunks: 3 × 500ms = 1.5 seconds of silence.
+	silenceChunks = 3
+
+	// minSpeechChunks: minimum chunks of speech before silence detection kicks in.
+	// Prevents triggering on the very first chunk if mic is quiet.
+	minSpeechChunks = 2
+)
+
 const sampleRate = 16000
 
 func main() {
@@ -88,16 +104,24 @@ func main() {
 		cancel()
 	}()
 
+	// onFinal is called whenever a complete utterance is transcribed.
+	// Replace this with your LLM call, e.g. sendToLLM(text).
+	onFinal := func(lang, text string) {
+		fmt.Printf("\n>>> [ASR FINAL] lang=%q\n    text: %s\n\n", lang, text)
+		// TODO: send `text` to your LLM module here, e.g.:
+		// go sendToLLM(text)
+	}
+
 	if *fileMode != "" {
-		streamFile(ctx, client, *fileMode, *language, *chunkMs)
+		streamFile(ctx, client, *fileMode, *language, *chunkMs, onFinal)
 	} else {
-		streamMic(ctx, client, *language, *chunkMs, *device)
+		streamMic(ctx, client, *language, *chunkMs, *device, onFinal)
 	}
 }
 
 // ─── File streaming ──────────────────────────────────────────────────────────
 
-func streamFile(ctx context.Context, client pb.ASRServiceClient, filePath, language string, chunkMs int) {
+func streamFile(ctx context.Context, client pb.ASRServiceClient, filePath, language string, chunkMs int, onFinal func(lang, text string)) {
 	fmt.Printf("Reading audio file via ffmpeg: %s\n", filePath)
 
 	// Use ffmpeg to decode any audio format to raw float32 PCM at 16 kHz mono
@@ -122,16 +146,19 @@ func streamFile(ctx context.Context, client pb.ASRServiceClient, filePath, langu
 		log.Fatalf("TranscribeStream failed: %v", err)
 	}
 
-	sendPCMStream(pipe, stream, language, chunkMs)
+	// File mode: no VAD needed, ffmpeg closes pipe at EOF → is_final triggered naturally
+	sendPCMStream(pipe, stream, language, chunkMs, false, onFinal)
 	cmd.Wait()
 }
 
 // ─── Mic streaming via ffmpeg ─────────────────────────────────────────────────
 
-func streamMic(ctx context.Context, client pb.ASRServiceClient, language string, chunkMs int, device string) {
+func streamMic(ctx context.Context, client pb.ASRServiceClient, language string, chunkMs int, device string, onFinal func(lang, text string)) {
 	args := buildFFmpegMicArgs(device)
 	fmt.Printf("Opening microphone via ffmpeg...\n")
 	fmt.Printf("  Platform: %s | Device: %q | Chunk: %dms | Language: %q\n\n", runtime.GOOS, device, chunkMs, language)
+	fmt.Printf("  Silence threshold: %.4f RMS | Silence timeout: %d × %dms = %dms\n",
+		silenceThreshold, silenceChunks, chunkMs, silenceChunks*chunkMs)
 	fmt.Println("  Speak now (Ctrl+C to stop):\n")
 
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
@@ -144,13 +171,24 @@ func streamMic(ctx context.Context, client pb.ASRServiceClient, language string,
 		log.Fatalf("Could not start ffmpeg: %v\n\nMake sure ffmpeg is installed:\n  Windows: winget install Gyan.FFmpeg\n  Linux:   sudo apt-get install ffmpeg", err)
 	}
 
-	stream, err := client.TranscribeStream(ctx)
-	if err != nil {
-		log.Fatalf("TranscribeStream failed: %v", err)
-	}
+	// Mic mode: loop forever, restarting a fresh gRPC stream after each utterance.
+	// VAD detects end-of-speech → sends is_final=true → awaits [final] → calls onFinal → repeat.
+	for {
+		stream, err := client.TranscribeStream(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return // user pressed Ctrl+C
+			}
+			log.Fatalf("TranscribeStream failed: %v", err)
+		}
 
-	sendPCMStream(pipe, stream, language, chunkMs)
-	cmd.Wait()
+		sendPCMStream(pipe, stream, language, chunkMs, true, onFinal)
+
+		if ctx.Err() != nil {
+			return // interrupted
+		}
+		fmt.Println("  [Listening for next utterance...]")
+	}
 }
 
 // buildFFmpegMicArgs returns platform-specific ffmpeg arguments for mic capture.
@@ -189,17 +227,61 @@ func buildFFmpegMicArgs(device string) []string {
 
 // ─── PCM stream sender ────────────────────────────────────────────────────────
 
-func sendPCMStream(r io.Reader, stream pb.ASRService_TranscribeStreamClient, language string, chunkMs int) {
+// rmsEnergy computes root-mean-square energy of a float32 LE PCM byte slice.
+func rmsEnergy(raw []byte) float64 {
+	n := len(raw) / 4
+	if n == 0 {
+		return 0
+	}
+	var sum float64
+	for i := 0; i < n; i++ {
+		bits := binary.LittleEndian.Uint32(raw[i*4 : i*4+4])
+		s := float64(math.Float32frombits(bits))
+		sum += s * s
+	}
+	return math.Sqrt(sum / float64(n))
+}
+
+// sendPCMStream reads raw float32 PCM from r and streams it to the gRPC server.
+// If useVAD=true, silence detection is active: after silenceChunks consecutive
+// silent chunks (post minSpeechChunks of speech), is_final=true is sent and
+// the function returns so the caller can start a fresh gRPC stream.
+func sendPCMStream(r io.Reader, stream pb.ASRService_TranscribeStreamClient, language string, chunkMs int, useVAD bool, onFinal func(lang, text string)) {
 	chunkSamples := sampleRate * chunkMs / 1000
 	chunkBytes := chunkSamples * 4 // float32 = 4 bytes
 	buf := make([]byte, chunkBytes)
 	reader := bufio.NewReaderSize(r, chunkBytes*4)
 
+	doneSend := make(chan struct{})
+
 	go func() {
+		defer close(doneSend)
+		silentCount := 0
+		speechCount := 0
+
 		for {
 			n, err := io.ReadFull(reader, buf)
 			if n > 0 {
-				isFinal := err != nil // last chunk if read failed
+				isFinal := err != nil // EOF = last chunk of file
+
+				if useVAD && !isFinal {
+					energy := rmsEnergy(buf[:n])
+					if energy < silenceThreshold {
+						silentCount++
+					} else {
+						silentCount = 0
+						speechCount++
+						fmt.Printf("  [speech] rms=%.4f\r", energy)
+					}
+
+					// End-of-speech: enough speech was heard, then silence long enough
+					if speechCount >= minSpeechChunks && silentCount >= silenceChunks {
+						fmt.Printf("\n  [silence detected — %.1fs — finalizing...]\n",
+							float64(silentCount*chunkMs)/1000.0)
+						isFinal = true
+					}
+				}
+
 				chunk := &pb.AudioChunk{
 					AudioData:  append([]byte(nil), buf[:n]...),
 					SampleRate: sampleRate,
@@ -210,6 +292,11 @@ func sendPCMStream(r io.Reader, stream pb.ASRService_TranscribeStreamClient, lan
 					log.Printf("Send error: %v", sendErr)
 					return
 				}
+
+				if isFinal {
+					stream.CloseSend()
+					return
+				}
 			}
 			if err != nil {
 				stream.CloseSend()
@@ -218,12 +305,13 @@ func sendPCMStream(r io.Reader, stream pb.ASRService_TranscribeStreamClient, lan
 		}
 	}()
 
-	receiveResponses(stream)
+	receiveResponses(stream, onFinal)
+	<-doneSend // wait for sender goroutine to finish too
 }
 
 // ─── Response handler ─────────────────────────────────────────────────────────
 
-func receiveResponses(stream pb.ASRService_TranscribeStreamClient) {
+func receiveResponses(stream pb.ASRService_TranscribeStreamClient, onFinal func(lang, text string)) {
 	for {
 		resp, err := stream.Recv()
 		if err == io.EOF {
@@ -239,6 +327,9 @@ func receiveResponses(stream pb.ASRService_TranscribeStreamClient) {
 		}
 		if resp.IsFinal {
 			fmt.Printf("\r[final]   lang=%q  text=%q\n", resp.Language, resp.Text)
+			if onFinal != nil && resp.Text != "" {
+				onFinal(resp.Language, resp.Text)
+			}
 		} else {
 			fmt.Printf("\r[partial] %q                    ", resp.Text)
 		}
