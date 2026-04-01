@@ -17,9 +17,11 @@ from app.grpc_servicer import ASRServicer
 logger = logging.getLogger(__name__)
 
 # --- Config from environment ---
+ASR_MODE               = os.getenv("ASR_MODE", "streaming").lower()
 MODEL_NAME             = os.getenv("MODEL_NAME", "Qwen/Qwen3-ASR-1.7B")
 GPU_MEMORY_UTILIZATION = float(os.getenv("GPU_MEMORY_UTILIZATION", "0.85"))
 MAX_MODEL_LEN          = int(os.getenv("MAX_MODEL_LEN", "4096"))
+MAX_NEW_TOKENS         = int(os.getenv("MAX_NEW_TOKENS", "32" if ASR_MODE == "streaming" else "1024"))
 HOST                   = os.getenv("HOST", "0.0.0.0")
 PORT                   = int(os.getenv("PORT", "8000"))
 GRPC_PORT              = int(os.getenv("GRPC_PORT", "50051"))
@@ -32,7 +34,7 @@ _grpc_server = None
 def _start_grpc_server(asr_model):
     """Start the gRPC server in a daemon thread."""
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
-    asr_pb2_grpc.add_ASRServiceServicer_to_server(ASRServicer(asr_model), server)
+    asr_pb2_grpc.add_ASRServiceServicer_to_server(ASRServicer(asr_model, mode=ASR_MODE), server)
     listen_addr = f"{HOST}:{GRPC_PORT}"
     server.add_insecure_port(listen_addr)
     server.start()
@@ -52,13 +54,16 @@ async def lifespan(app: FastAPI):
     global asr, _grpc_server
 
     print(f"[startup] Loading model: {MODEL_NAME}")
+    print(f"[startup] Mode: {ASR_MODE}")
     print(f"[startup] GPU memory utilization: {GPU_MEMORY_UTILIZATION}")
     print(f"[startup] Max model len: {MAX_MODEL_LEN}")
+    print(f"[startup] Max new tokens: {MAX_NEW_TOKENS}")
 
     asr = Qwen3ASRModel.LLM(
         model=MODEL_NAME,
         gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         max_model_len=MAX_MODEL_LEN,
+        max_new_tokens=MAX_NEW_TOKENS,
         disable_log_stats=True,
     )
     print("[startup] Model loaded.")
@@ -89,6 +94,7 @@ def health():
     return {
         "status": "ok",
         "model": MODEL_NAME,
+        "mode": ASR_MODE,
         "ready": asr is not None,
         "http_port": PORT,
         "grpc_port": GRPC_PORT,

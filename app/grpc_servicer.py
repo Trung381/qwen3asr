@@ -32,16 +32,70 @@ class ASRServicer(asr_pb2_grpc.ASRServiceServicer):
     """
     gRPC servicer for bidirectional streaming ASR.
 
-    The client streams AudioChunk messages containing raw PCM float32 audio.
+    If mode=="streaming": The client streams AudioChunk messages containing raw PCM float32 audio.
     After each chunk the server responds with a partial TranscriptChunk.
     When the client sends is_final=True, the server flushes the streaming
     state and returns the consolidated final transcript.
+
+    If mode=="non-streaming": The server buffers the AudioChunks. Only when is_final=True is hit, 
+    the server runs transcribe() and returns a single final TranscriptChunk.
     """
 
-    def __init__(self, asr_model):
+    def __init__(self, asr_model, mode="streaming"):
         self.asr = asr_model
+        self.mode = mode
 
     def TranscribeStream(self, request_iterator, context):
+        """
+        Bidirectional streaming RPC wrapper. Routes to the appropriate handler mode.
+        """
+        if self.mode == "streaming":
+            yield from self._transcribe_streaming(request_iterator, context)
+        else:
+            yield from self._transcribe_non_streaming(request_iterator, context)
+
+    def _transcribe_non_streaming(self, request_iterator, context):
+        """
+        Handles requests in non-streaming mode. Buffers all incoming audio chunks,
+        then calls the one-shot `asr.transcribe()` method at the end.
+        """
+        audio_buffer = []
+        language = None
+
+        try:
+            for chunk in request_iterator:
+                if language is None and chunk.language:
+                    language = chunk.language
+                
+                audio_buffer.append(chunk.audio_data)
+                sr = chunk.sample_rate if chunk.sample_rate > 0 else 16000
+
+                if chunk.is_final:
+                    break
+            
+            if not audio_buffer:
+                return
+
+            wav = np.frombuffer(b"".join(audio_buffer), dtype=np.float32)
+            if sr != 16000:
+                wav = _resample_to_16k(wav, sr)
+
+            results = self.asr.transcribe(audio=(wav, 16000), language=language)
+            result = results[0]
+
+            yield asr_pb2.TranscriptChunk(
+                text=result.text or "",
+                language=result.language or "",
+                is_final=True,
+            )
+
+        except Exception as e:
+            logger.exception("Error in _transcribe_non_streaming")
+            context.set_details(str(e))
+            context.set_code(grpc.StatusCode.INTERNAL)
+            return
+
+    def _transcribe_streaming(self, request_iterator, context):
         """
         Bidirectional streaming RPC.
         Reads AudioChunk messages, runs streaming inference, yields TranscriptChunk responses.
@@ -93,7 +147,7 @@ class ASRServicer(asr_pb2_grpc.ASRServiceServicer):
                 )
 
         except Exception as e:
-            logger.exception("Error in TranscribeStream")
+            logger.exception("Error in _transcribe_streaming")
             context.set_details(str(e))
             context.set_code(grpc.StatusCode.INTERNAL)
             return

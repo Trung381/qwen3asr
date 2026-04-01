@@ -59,7 +59,7 @@ const (
 
 	// silenceChunks: how many consecutive silent chunks before we treat it
 	// as end-of-speech. At 500ms chunks: 3 × 500ms = 1.5 seconds of silence.
-	silenceChunks = 3
+	silenceChunks = 2
 
 	// minSpeechChunks: minimum chunks of speech before silence detection kicks in.
 	// Prevents triggering on the very first chunk if mic is quiet.
@@ -69,12 +69,12 @@ const (
 const sampleRate = 16000
 
 func main() {
-	host        := flag.String("host", "localhost", "gRPC server host")
-	port        := flag.Int("port", 50051, "gRPC server port")
-	language    := flag.String("language", "", "Language hint (e.g. 'English', 'Chinese'). Empty = auto-detect")
-	chunkMs     := flag.Int("chunk-ms", 500, "Audio chunk size in milliseconds")
-	fileMode    := flag.String("file", "", "Path to audio file to stream instead of microphone")
-	device      := flag.String("device", "", "Audio input device name (Windows: from --list-devices, Linux: e.g. 'default')")
+	host := flag.String("host", "localhost", "gRPC server host")
+	port := flag.Int("port", 50051, "gRPC server port")
+	language := flag.String("language", "", "Language hint (e.g. 'English', 'Chinese'). Empty = auto-detect")
+	chunkMs := flag.Int("chunk-ms", 500, "Audio chunk size in milliseconds")
+	fileMode := flag.String("file", "", "Path to audio file to stream instead of microphone")
+	device := flag.String("device", "", "Audio input device name (Windows: from --list-devices, Linux: e.g. 'default')")
 	listDevices := flag.Bool("list-devices", false, "List available audio input devices and exit")
 	flag.Parse()
 
@@ -331,6 +331,8 @@ func receiveResponses(stream pb.ASRService_TranscribeStreamClient, onFinal func(
 				onFinal(resp.Language, resp.Text)
 			}
 		} else {
+			// Note: If the server is configured with ASR_MODE=non-streaming,
+			// it buffers audio and does not send partial results until the end.
 			fmt.Printf("\r[partial] %q                    ", resp.Text)
 		}
 	}
@@ -391,7 +393,7 @@ func readWavMono16k(path string) ([]float32, error) {
 			samples = append(samples, s)
 		}
 	case 32:
-		for i := 0; i+3 < len(data); i += 4*numChannels {
+		for i := 0; i+3 < len(data); i += 4 * numChannels {
 			bits := binary.LittleEndian.Uint32(data[i : i+4])
 			samples = append(samples, math.Float32frombits(bits))
 		}

@@ -10,6 +10,7 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       # --- Tunable config (override via .env or CLI) ---
+      - ASR_MODE=${ASR_MODE:-streaming}
       - MODEL_NAME=${MODEL_NAME:-Qwen/Qwen3-ASR-1.7B}
       - GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.85}
       - MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
